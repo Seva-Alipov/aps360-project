@@ -1,1 +1,7 @@
 /training_data
+/training_data_backup
+/neural_net/codet5_poc_ckpt
+/neural_net/codet5_poc_model
+neural_net/.venv
+*.txt
+*.pt
