@@ -25,8 +25,8 @@ SEED = int(os.environ.get("SEED", "42"))
 TRAIN_FRAC = float(os.environ.get("TRAIN_FRAC", "0.8"))
 VAL_FRAC   = float(os.environ.get("VAL_FRAC", "0.1"))
 
-MAX_SRC_LEN = int(os.environ.get("MAX_SRC_LEN", "384"))
-MAX_TGT_LEN = int(os.environ.get("MAX_TGT_LEN", "256"))
+MAX_SRC_LEN = int(os.environ.get("MAX_SRC_LEN", "2048"))
+MAX_TGT_LEN = int(os.environ.get("MAX_TGT_LEN", "1024"))
 
 EPOCHS = float(os.environ.get("EPOCHS", "10"))
 LR     = float(os.environ.get("LR", "3e-4"))
@@ -112,6 +112,104 @@ def normalize_c_style(c_src: str) -> str:
 
     return out.strip()
 
+def normalize_asm(s_src: str) -> str:
+    """
+    Strip noisy GCC/Clang x86-64 .s output while keeping:
+      - function & local labels (compare:, .L3:, .LC0:)
+      - instructions
+      - string constants (and other data) from .rodata / .data
+
+    Drops:
+      - .file, .text, .globl, .type, .size, .ident
+      - .cfi_* unwind info
+      - .section .note*, .note.GNU-stack, etc.
+      - .align, .long, etc in note/metadata sections
+    """
+    current_section = None
+    out_lines = []
+
+    for raw in s_src.splitlines():
+        ln = raw.rstrip("\n")
+        stripped = ln.strip()
+        if not stripped:
+            continue
+
+        # Full-line comments
+        if stripped.startswith(("#", "//", ";")):
+            continue
+
+        # Section tracking
+        if stripped.startswith(".section"):
+            # Example: .section  .rodata
+            m = re.match(r"\.section\s+([\.A-Za-z0-9_]+)", stripped)
+            if m:
+                current_section = m.group(1)
+            else:
+                current_section = None
+            # We don't emit .section lines
+            continue
+
+        # Drop simple section markers
+        if stripped == ".text":
+            current_section = ".text"
+            continue
+
+        # Handle directives (start with '.')
+        if stripped.startswith("."):
+            # Common junk to always drop
+            JUNK_PREFIXES = (
+                ".file",
+                ".globl",
+                ".type",
+                ".size",
+                ".cfi_",
+                ".ident",
+                ".note",   # .note.GNU-stack, .note.gnu.property, etc.
+                ".p2align",
+                ".align",
+            )
+            if any(stripped.startswith(p) for p in JUNK_PREFIXES):
+                continue
+
+            # Keep .string (and optionally numeric data) only in rodata/data
+            if current_section in (".rodata", ".data"):
+                head = stripped.split()[0]
+                if head == ".string":
+                    # Keep string constants (user messages etc.)
+                    out_lines.append(stripped)
+                    continue
+                if head in (".byte", ".word", ".short", ".long", ".quad"):
+                    # Optional: keep numeric constants too
+                    out_lines.append(stripped)
+                    continue
+
+            # All other directives are dropped
+            continue
+
+        # Now: labels and instructions (don't start with '.')
+        # Remove trailing inline comments
+        for marker in ("//", "#", ";"):
+            idx = stripped.find(marker)
+            if idx != -1:
+                stripped = stripped[:idx].rstrip()
+        if not stripped:
+            continue
+
+        # Normalize whitespace in instructions, but keep labels as-is
+        if stripped.endswith(":"):
+            # Label line (compare:, .L4:, .LC0:, etc.)
+            out_lines.append(stripped)
+        else:
+            # Instruction line, collapse whitespace
+            parts = stripped.split()
+            out_lines.append(" ".join(parts))
+
+    # Join and avoid big runs of blank lines (we already skip empty)
+    return "\n".join(out_lines).strip()
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME, use_safetensors=True)
+
 def make_dataset_from_stems(stems: List[str]) -> List[Dict[str, str]]:
     items = []
     for stem in stems:
@@ -122,6 +220,17 @@ def make_dataset_from_stems(stems: List[str]) -> List[Dict[str, str]]:
         c_txt = load_text(c_path)
         s_txt = load_text(s_path)
         if c_txt and s_txt:
+            # Clean up assembly first
+            s_txt = normalize_asm(s_txt)
+
+            # Optional: enforce a hard cap on extremely long examples
+            tok_count = len(tokenizer(s_txt)["input_ids"])
+            if tok_count > MAX_SRC_LEN * 3:
+                print(f"[WARN] Skipping {stem}.s: {tok_count} tokens even after normalization.")
+                continue
+            if tok_count > MAX_SRC_LEN:
+                print(f"[WARN] {stem}.s has {tok_count} tokens after normalization; will be truncated to {MAX_SRC_LEN}.")
+
             c_txt = normalize_c_style(c_txt)
             items.append({"src": s_txt, "tgt": c_txt})
     return items
@@ -144,9 +253,6 @@ raw = DatasetDict(
     validation=Dataset.from_list(val_items),
     test=Dataset.from_list(test_items) if test_items else Dataset.from_list([]),
 )
-
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
-model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME, use_safetensors=True)
 
 def preprocess(batch):
     model_inputs = tokenizer(batch["src"], max_length=MAX_SRC_LEN, truncation=True)

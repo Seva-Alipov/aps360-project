@@ -5,3 +5,4 @@
 neural_net/.venv
 *.txt
 *.pt
+.vscode
